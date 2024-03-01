@@ -24,6 +24,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog"
+
 	// Uncomment the following line to load the gcp plugin (only required to authenticate against GKE clusters).
 	// _ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 
@@ -59,18 +60,25 @@ func main() {
 		klog.Fatalf("Error building example clientset: %s", err.Error())
 	}
 
+	// InformerFactoryはInformerを生成するためのオブジェクト
 	kubeInformerFactory := kubeinformers.NewSharedInformerFactory(kubeClient, time.Second*30)
 	exampleInformerFactory := informers.NewSharedInformerFactory(exampleClient, time.Second*30)
 
+	// exampleInformerFactory.Samplecontroller().V1alpha1().Foos()と
+	// kubeInformerFactory.Apps().V1().Deployments()は
+	// それぞれInformerを返す関数
 	controller := NewController(kubeClient, exampleClient,
 		kubeInformerFactory.Apps().V1().Deployments(),
 		exampleInformerFactory.Samplecontroller().V1alpha1().Foos())
 
 	// notice that there is no need to run Start methods in a separate goroutine. (i.e. go kubeInformerFactory.Start(stopCh)
 	// Start method is non-blocking and runs all registered informers in a dedicated goroutine.
+	// それぞれのInformerの開始を実行
 	kubeInformerFactory.Start(stopCh)
 	exampleInformerFactory.Start(stopCh)
 
+	// 関数Runの第一引数は並行で実行させるJob数（threadiness）。
+	// ここでは２台のControllerを並行して実行させている。
 	if err = controller.Run(2, stopCh); err != nil {
 		klog.Fatalf("Error running controller: %s", err.Error())
 	}
