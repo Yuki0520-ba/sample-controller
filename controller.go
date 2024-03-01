@@ -93,8 +93,10 @@ func NewController(
 	// Create event broadcaster
 	// Add sample-controller types to the default Kubernetes Scheme so Events can be
 	// logged for sample-controller types.
+	// Schemeへの登録処理を実行
 	utilruntime.Must(samplescheme.AddToScheme(scheme.Scheme))
 	klog.V(4).Info("Creating event broadcaster")
+	// Eventを記録するRecorderを構成
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartLogging(klog.Infof)
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubeclientset.CoreV1().Events("")})
@@ -113,6 +115,8 @@ func NewController(
 
 	klog.Info("Setting up event handlers")
 	// Set up an event handler for when Foo resources change
+	// AddFunc（新規作成時）とUpdateFunc（更新時）のイベントが起きた時にどの処理を発火させるか定義している
+	// ここではcontroller.enqueueFooを実行し、Workqueueに追加するような処理を発火させるようにしている。
 	fooInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: controller.enqueueFoo,
 		UpdateFunc: func(old, new interface{}) {
@@ -125,6 +129,8 @@ func NewController(
 	// processing. This way, we don't need to implement custom logic for
 	// handling Deployment resources. More info on this pattern:
 	// https://github.com/kubernetes/community/blob/8cafef897a22026d42f5e5bb3f104febe7e29830/contributors/devel/controllers.md
+	// Deployentのイベントが発生した際にどの処理を発火させるかが定義されている。
+	// ここではAdd、Update、Delete全てのイベントでhandleObjectを発火させている。
 	deploymentInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: controller.handleObject,
 		UpdateFunc: func(old, new interface{}) {
@@ -177,6 +183,10 @@ func (c *Controller) Run(threadiness int, stopCh <-chan struct{}) error {
 // processNextWorkItem function in order to read and process a message on the
 // workqueue.
 func (c *Controller) runWorker() {
+	// processNextWorkItemからFalseが帰ってくるか、
+	// 呼び出し元のタイムアウトや、StopChが決まるまで永遠にループして実行する形になる。
+	// for <BOOL>{}でループを継続するか判定、Whileの判定に近しい。
+	// 関数c.processNextWorkItem()でエラーが吐き出されてもそのまま捨てられる？
 	for c.processNextWorkItem() {
 	}
 }
@@ -186,6 +196,8 @@ func (c *Controller) runWorker() {
 func (c *Controller) processNextWorkItem() bool {
 	obj, shutdown := c.workqueue.Get()
 
+	// Workqueueがからの場合
+	// 呼び出し元へFalseを返して呼び出し元のループ処理を終了させる。
 	if shutdown {
 		return false
 	}
@@ -218,11 +230,20 @@ func (c *Controller) processNextWorkItem() bool {
 		// Foo resource to be synced.
 		if err := c.syncHandler(key); err != nil {
 			// Put the item back on the workqueue to handle any transient errors.
+			// エラーが起きた際は再度workqueueに再度enqueueし、一定時間経過後に再度Syncする処理がなされる。
+			// すぐに実行しないのは、NWなどの一時的なエラーで失敗するのを避けるため。
+			// defer c.workqueue.Done(obj)で指定したオブジェクトの削除はForgetが実行されていないからか、ここでは行われない。
 			c.workqueue.AddRateLimited(key)
 			return fmt.Errorf("error syncing '%s': %s, requeuing", key, err.Error())
 		}
 		// Finally, if no error occurs we Forget this item so it does not
 		// get queued again until another change happens.
+		// Controller.workqueue.Forgetでobjの追跡を停止する。(追跡を停止するとは？EventHandlerによるWorkquue内の対象のObjectの更新がなされないということ？)
+		// この後にReconsileが完了したことを呼び出し元に知らせるc.workqueue.Done(obj)が実行され、workqueueからobjが削除される。
+		// syncHandler関数でnilが返ってきてもこちらの処理が実行され、Workqueueから削除される。
+		// つまり成功時以外にも、
+		// 指定のFooオブジェクトが見つからない時や、FooオブジェクトのDeploymentNamegが空の時（””のとき）にも
+		// Workqueueから削除され、Reconcileの処理は一旦終了されてしまう。
 		c.workqueue.Forget(obj)
 		klog.Infof("Successfully synced '%s'", key)
 		return nil
@@ -236,11 +257,13 @@ func (c *Controller) processNextWorkItem() bool {
 	return true
 }
 
+// ここでReconcile処理が実装されている。
 // syncHandler compares the actual state with the desired, and attempts to
 // converge the two. It then updates the Status block of the Foo resource
 // with the current status of the resource.
 func (c *Controller) syncHandler(key string) error {
 	// Convert the namespace/name string into a distinct namespace and name
+	// keyは「namespace/name」の形式の文字れとなっているため「/」を区切り文字としてNameSpaceとNameにSplitする。
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("invalid resource key: %s", key))
@@ -285,6 +308,7 @@ func (c *Controller) syncHandler(key string) error {
 
 	// If the Deployment is not controlled by this Foo resource, we should log
 	// a warning to the event recorder and return error msg.
+	// foo.spec.DeploymenNameのDeploymentがFooによって管理されているか（すでに作成されているものでないか）を判定。
 	if !metav1.IsControlledBy(deployment, foo) {
 		msg := fmt.Sprintf(MessageResourceExists, deployment.Name)
 		c.recorder.Event(foo, corev1.EventTypeWarning, ErrResourceExists, msg)
@@ -294,6 +318,9 @@ func (c *Controller) syncHandler(key string) error {
 	// If this number of the replicas on the Foo resource is specified, and the
 	// number does not equal the current desired replicas on the Deployment, we
 	// should update the Deployment resource.
+	// Replicasが一致していない場合は、Deployment typeのデータを生成し、既存のDeploymentを更新する。
+	// なぜ既存のDeploymentを取得→パラメータを更新して、アップデートというような処理ではなく、
+	// 毎度newDeployment()でDeploymentのデータを生成する形にしているのか気になる。。。
 	if foo.Spec.Replicas != nil && *foo.Spec.Replicas != *deployment.Spec.Replicas {
 		klog.V(4).Infof("Foo %s replicas: %d, deployment replicas: %d", name, *foo.Spec.Replicas, *deployment.Spec.Replicas)
 		deployment, err = c.kubeclientset.AppsV1().Deployments(foo.Namespace).Update(newDeployment(foo))
@@ -321,6 +348,12 @@ func (c *Controller) updateFooStatus(foo *samplev1alpha1.Foo, deployment *appsv1
 	// NEVER modify objects from the store. It's a read-only, local cache.
 	// You can use DeepCopy() to make a deep copy of original object and modify this copy
 	// Or create a copy manually for better performance
+	// 基本的にKubernetesオブジェクトは読み取り専用を想定しており、
+	// 直接変更するとInformarの処理間で差分が生じてしまう。（ポインタで参照されているから？）
+	// そのためDeepCopyでオブジェクトのクローンを作成して、そのクローンデータのパラメータを変更し、
+	// 本体のオブジェクトのUpdate関数を実行する。
+	// このブランチのバージョンではバージョンが古く、Update関数でステータスを更新しているが、
+	// おそらく現在のバージョンではステータス更新専用の関数UpdateStatusを使うべきと、下のコメントで書かれている。
 	fooCopy := foo.DeepCopy()
 	fooCopy.Status.AvailableReplicas = deployment.Status.AvailableReplicas
 	// If the CustomResourceSubresources feature gate is not enabled,
@@ -337,6 +370,9 @@ func (c *Controller) updateFooStatus(foo *samplev1alpha1.Foo, deployment *appsv1
 func (c *Controller) enqueueFoo(obj interface{}) {
 	var key string
 	var err error
+	// 関数の引数に渡ってきたFooオブジェクトのキー（namespace/name）をWorkqueueへ追加する。
+	// Workqueueへ追加されたFooオブジェクトはのちにReconcile処理（processNextWorkItem関数）
+	// でDequeueされ処理される。
 	if key, err = cache.MetaNamespaceKeyFunc(obj); err != nil {
 		utilruntime.HandleError(err)
 		return
@@ -349,6 +385,8 @@ func (c *Controller) enqueueFoo(obj interface{}) {
 // objects metadata.ownerReferences field for an appropriate OwnerReference.
 // It then enqueues that Foo resource to be processed. If the object does not
 // have an appropriate OwnerReference, it will simply be skipped.
+// 引数objにはDeployment型のObjectが渡ってくる想定。
+// 渡ってきたDeploymentを所有しているFooオブジェクトをWorkqueueに追加する。
 func (c *Controller) handleObject(obj interface{}) {
 	var object metav1.Object
 	var ok bool
@@ -369,6 +407,9 @@ func (c *Controller) handleObject(obj interface{}) {
 	if ownerRef := metav1.GetControllerOf(object); ownerRef != nil {
 		// If this object is not owned by a Foo, we should not do anything more
 		// with it.
+		// Deploymentに所有者が存在する＆その所有者がFooオブジェクトの場合、Workqueueに追加して
+		// のちほどReconcileの処理（processNextWorkItem関数）で取り出して処理（再構成）する。
+		// Deploymentに所有者が存在しない or 所有者がFooオブジェクト以外の場合は、Workquueに追加しない（何も処理を起こさない）
 		if ownerRef.Kind != "Foo" {
 			return
 		}
@@ -397,6 +438,8 @@ func newDeployment(foo *samplev1alpha1.Foo) *appsv1.Deployment {
 			Name:      foo.Spec.DeploymentName,
 			Namespace: foo.Namespace,
 			OwnerReferences: []metav1.OwnerReference{
+				// ”OwnerReferences: []metav1.OwnerReference”を追加することで
+				// Fooリソースが削除されたタイミングでそのFooが所持するDeploymentも合わせて削除される。
 				*metav1.NewControllerRef(foo, samplev1alpha1.SchemeGroupVersion.WithKind("Foo")),
 			},
 		},
